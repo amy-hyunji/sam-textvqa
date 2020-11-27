@@ -164,10 +164,31 @@ def get_loader(task_cfg, tokenizer, split):
     )
     return loader
 
+def _get_loader(task_cfg, tokenizer, split):
+    
+    random_sampler = RandomSampler(dataset_instance)
+    loader = DataLoader(
+        dataset_instance,
+        sampler=random_sampler if split == "train" else None,
+        batch_size=task_cfg["batch_size"],
+        num_workers=task_cfg["num_workers"],
+        pin_memory=True,
+        shuffle=False,
+        drop_last=False,
+    )
+    return loader
 
 def load_datasets(task_cfg, splits):
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True)
     loaders = {}
     for split in splits:
         loaders[split] = get_loader(task_cfg, tokenizer, split)
+    return loaders
+
+
+def load_dataset(task_cfg, split):
+    assert(split == "eval")
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True)
+    loaders = {}
+    loaders[split] = get_loader(task_cfg, tokenizer, split)
     return loaders

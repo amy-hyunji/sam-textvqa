@@ -26,7 +26,7 @@ class SAM4C(nn.Module):
         super().__init__()
         self.mmt_config = mmt_config
         self.text_bert_config = text_bert_config
-        self.frcn_encoder_type = "default"
+        self.frcn_encoder_type = "finetune_faster_rcnn_fpn_fc7"
         if not self.mmt_config.use_phoc_fasttext:
             logger.info("Not using Fasttext and PHOC features for OCR")
 

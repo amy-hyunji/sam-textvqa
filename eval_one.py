@@ -12,6 +12,7 @@ from sam.datasets.metrics import STVQAANLSEvaluator, TextVQAAccuracyEvaluator
 from sam.task_utils import forward_model
 from tools.registry import registry
 
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
     datefmt="%m/%d/%Y %H:%M:%S",
@@ -21,14 +22,93 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-vqa_evaluator = TextVQAAccuracyEvaluator()
-anls_evaluator = STVQAANLSEvaluator()
+def get_config():
+    # load command line args
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Random seed for reproducibility"
+    )
+    parser.add_argument("--config", required=True, type=str, help="Experiment configuration file")
+
+    parser.add_argument(
+        "--tag", type=str, help="Experiment folder name", default="debug"
+    )
+
+    parser.add_argument("--pretrained_eval", default="./data/pre-trained-models/best_model.tar")
+    args = parser.parse_args()
+
+    # Load configuration
+    with open(args.config, "r") as f:
+        task_cfg = edict(yaml.safe_load(f))
+
+    # Todo: Move below code to another function
+    # Reproducibility seeds
+    seed = task_cfg["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    logger.info("-" * 20 + "Command Line Config: " + "-" * 20)
+    print(pprint(vars(args)))
+    logger.info("-" * 20 + "Task File Config: " + "-" * 20)
+    print(pprint(task_cfg))
+
+    # Build save path
+    save_path = os.path.join(task_cfg["output_dir"], args.tag)
+    if not os.path.exists(save_path) and args.pretrained_eval == "":
+        os.makedirs(save_path)
+
+    # Dump all configs
+    with open(os.path.join(save_path, "command.txt"), "w") as f:
+        print(f"Command Line: \n {str(vars(args))} \n \n", file=f)
+        print(f"Config File: \n {str(vars(task_cfg))} \n \n", file=f)
+
+    # Add all configs to registry
+    registry.update(vars(args))
+    registry.update(task_cfg)
+
+    return task_cfg, args, save_path
+
+
+def main():
+    task_cfg, args, save_path = get_config()
+    checkpoint_path = os.path.join(save_path, "best_model.tar")
+    base_lr = task_cfg["lr"]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpu = torch.cuda.device_count()
+    logger.info(f"Device: {device}, Numer of GPUs: {n_gpu}")
+
+    dataloaders = load_datasets(task_cfg, ["eval"])
+
+    mmt_config = BertConfig.from_dict(task_cfg["SA-M4C"])
+    text_bert_config = BertConfig.from_dict(task_cfg["TextBERT"])
+    model = SAM4C(mmt_config, text_bert_config)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Training Parameters: {trainable_params}")
+    optimizer_grouped_parameters = model.get_optimizer_parameters(base_lr)
+    print(len(list(model.named_parameters())), len(optimizer_grouped_parameters))
+
+    optimizer, warmup_scheduler = get_optim_scheduler(
+        task_cfg, optimizer_grouped_parameters, base_lr
+    )
+    start_iter_id, global_step, start_epoch = 0, 0, 0
+    model.to(device)
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.cuda()
+
+    if n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    return args.pretrained_eval, model, dataloaders
 
 
 class Evaluator:
+
     def __init__(self, checkpoint_path, model, dataloaders, task):
         self.vocabs = {}
-        task_cfg, args, save_path = get_config()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_path = checkpoint_path
         self.model = model
@@ -51,10 +131,6 @@ class Evaluator:
             self.vocabs[task] = vocab
 
     def evaluate_no_beam(self, split):
-        evalai_file = os.path.join(
-            os.path.dirname(self.checkpoint_path),
-            f"evalai_{split}.json",
-        )
 
         evalai_preds = self.run_model_no_beam(split)
 
@@ -62,7 +138,6 @@ class Evaluator:
             json.dump(evalai_preds, f)
 
         print(f"Dumping file: {evalai_file}")
-
 
 
     def evaluate(self, split, beam_size):
@@ -145,7 +220,6 @@ class Evaluator:
             "complete_seqs": [],
             # 'ocr_tokens': []
         }
-        self.model.eval()
         with torch.no_grad():
             for batch in tqdm(self.dataloaders[split], desc="Beam Search Evaluation"):
                 # Batch is updated inside the method, no outputs are needed
@@ -157,9 +231,9 @@ class Evaluator:
                     predictions[key].append(batch[key])
                 break
 
-        self.model.train()
         return predictions
 
+    """
     def run_model_no_beam(self, split):
         scores, batch_sizes = [], []
         predictions = []
@@ -175,6 +249,13 @@ class Evaluator:
 
         evalai_preds = [{"question_id": x["question_id"], "answer": x["pred_answer"]} for x in predictions]
         return evalai_preds
+    """
+    def run_model_no_beam(self):
+        self.model.eval()
+        with torch.no_grad():
+            results_dict = self.model(batch_dict, False)
+            print("results_dict: {results_dict}")
+        return results_dict
 
     def restore_checkpoint(self):
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
@@ -355,3 +436,14 @@ def evaluate_predictions(eval_df, results_df, vocab, acc_type="vqa", tokens_from
         "accuracies_df": accuracies_df,
         "best_result_df": best_result_df,
     }
+
+
+if __name__ == "__main__":
+    checkpoint_path, model, dataloaders = main()
+
+    assert os.path.exists(checkpoint_path)
+    task = registry["val_on"][0]
+    print(f"tast: {task}")
+    evaluator = Evaluator(checkpoint_path, model, dataloaders, task)
+
+    evaluator.evaluate_no_beam(split=split)
